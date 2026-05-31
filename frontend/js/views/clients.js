@@ -282,7 +282,7 @@ window.AppViews.Clients = {
                     window.toast.success('Клиент илова шуд');
                 }
                 formShow.value = false;
-                await load();
+                window.EventBus?.emit('data:clients'); await load();
             } catch (e) { window.toast.error(e.message); }
         }
 
@@ -304,13 +304,21 @@ window.AppViews.Clients = {
                         await window.API.clients.remove(c.id);
                         window.toast.success('Клиент нест шуд');
                         confirm.show = false;
-                        await load();
+                        window.EventBus?.emit('data:clients'); await load();
                     } catch (e) { window.toast.error(e.message); }
                 },
             });
         }
 
-        Vue.onMounted(load);
+        const _evtCleanup = [];
+        Vue.onMounted(() => {
+            load();
+            ['data:clients', 'data:orders'].forEach(ev => {
+                const off = window.EventBus?.on(ev, load);
+                if (off) _evtCleanup.push(off);
+            });
+        });
+        Vue.onUnmounted(() => { _evtCleanup.forEach(fn => fn()); });
 
         return {
             clients, filtered, loading, q, statusFilter,
