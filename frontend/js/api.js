@@ -1,9 +1,18 @@
-/* AliStroy CRM API client */
+/* AliStroy CRM API client (with auth token) */
 window.API = (function () {
     const base = '/api';
+    const TOKEN_KEY = 'alistroy_token';
+
+    function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+    function setToken(t) {
+        if (t) localStorage.setItem(TOKEN_KEY, t);
+        else localStorage.removeItem(TOKEN_KEY);
+    }
 
     async function req(path, opts = {}) {
         const headers = opts.headers || {};
+        const token = getToken();
+        if (token) headers['Authorization'] = 'Bearer ' + token;
         const config = { method: opts.method || 'GET', headers };
         if (opts.body !== undefined && !(opts.body instanceof FormData)) {
             headers['Content-Type'] = 'application/json';
@@ -12,6 +21,13 @@ window.API = (function () {
             config.body = opts.body;
         }
         const res = await fetch(base + path, config);
+
+        if (res.status === 401) {
+            setToken('');
+            // Бар auth.js нишонае диҳад
+            window.dispatchEvent(new CustomEvent('auth:logout'));
+            throw new Error('Авторизация лозим');
+        }
         if (!res.ok) {
             let err;
             try { err = await res.json(); } catch (e) { err = { error: res.statusText }; }
@@ -21,7 +37,41 @@ window.API = (function () {
         return res.json();
     }
 
+    // Боргирии файл (binary)
+    async function downloadFile(path, filename) {
+        const token = getToken();
+        const res = await fetch(base + path, {
+            headers: token ? { 'Authorization': 'Bearer ' + token } : {},
+        });
+        if (!res.ok) {
+            throw new Error('Хатои боргирӣ');
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        // Filename аз header-и Content-Disposition (агар бошад)
+        const cd = res.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename="([^"]+)"/);
+        a.download = m ? m[1] : (filename || 'export');
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+    }
+
     return {
+        // Token management
+        token: { get: getToken, set: setToken },
+
+        // Auth
+        auth: {
+            login: (username, password) =>
+                req('/auth/login', { method: 'POST', body: { username, password } }),
+            logout: () => req('/auth/logout', { method: 'POST' }).catch(() => null),
+            me: () => req('/auth/me'),
+        },
+
         // Health
         health: () => req('/health'),
 
@@ -92,6 +142,24 @@ window.API = (function () {
             remove: (id) => req('/orders/' + id, { method: 'DELETE' }),
         },
 
+        // Expenses
+        expenses: {
+            list: (params = {}) => {
+                const qs = new URLSearchParams();
+                Object.entries(params).forEach(([k, v]) => {
+                    if (v !== '' && v !== null && v !== undefined) qs.set(k, v);
+                });
+                const s = qs.toString();
+                return req('/expenses' + (s ? '?' + s : ''));
+            },
+            create: (data) => req('/expenses', { method: 'POST', body: data }),
+            update: (id, data) => req('/expenses/' + id, { method: 'PUT', body: data }),
+            remove: (id) => req('/expenses/' + id, { method: 'DELETE' }),
+        },
+
+        // Finance
+        finance: (period = 'all') => req('/finance/stats?period=' + period),
+
         // Dashboard / Mind map / Search
         dashboard: () => req('/dashboard/stats'),
         mindmap: () => req('/mindmap'),
@@ -102,6 +170,28 @@ window.API = (function () {
             const fd = new FormData();
             fd.append('file', file);
             return req('/upload', { method: 'POST', body: fd });
+        },
+
+        // Export
+        export: (entity, format = 'xlsx') =>
+            downloadFile(`/export/${entity}?format=${format}`),
+    };
+})();
+
+// Global Event Bus — барои auto-refresh-и саҳифаҳо
+window.EventBus = (function () {
+    const listeners = {};
+    return {
+        on(event, cb) {
+            (listeners[event] = listeners[event] || []).push(cb);
+            return () => {
+                listeners[event] = (listeners[event] || []).filter(x => x !== cb);
+            };
+        },
+        emit(event, payload) {
+            (listeners[event] || []).forEach(cb => {
+                try { cb(payload); } catch (e) { console.error(e); }
+            });
         },
     };
 })();

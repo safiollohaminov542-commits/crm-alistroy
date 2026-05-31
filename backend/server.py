@@ -5,12 +5,18 @@ AliStroy CRM — Standalone HTTP server (без зависимостей).
 """
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
+import time
 import uuid
+import zipfile
 import mimetypes
 from datetime import datetime, timedelta, date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +28,54 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 DB_PATH = os.path.join(BASE_DIR, "alistroy.db")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Auth (admin only — single-user CRM)
+# ---------------------------------------------------------------------------
+ADMIN_USERNAME = os.environ.get("CRM_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("CRM_ADMIN_PASS", "alistroy@2026@safi")
+SESSION_TTL = 60 * 60 * 24 * 7  # 7 рӯз
+
+# token -> {"user": str, "expires": float}
+SESSIONS: dict[str, dict] = {}
+
+
+def _new_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _check_password(username: str, password: str) -> bool:
+    """Простой constant-time check — admin/parol дар environment ё default."""
+    u_ok = secrets.compare_digest(username or "", ADMIN_USERNAME)
+    p_ok = secrets.compare_digest(password or "", ADMIN_PASSWORD)
+    return u_ok and p_ok
+
+
+def _get_token_from_headers(headers) -> str | None:
+    auth = headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return None
+
+
+def _is_authed(headers) -> bool:
+    token = _get_token_from_headers(headers)
+    if not token:
+        return False
+    sess = SESSIONS.get(token)
+    if not sess:
+        return False
+    if sess["expires"] < time.time():
+        SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+def _cleanup_sessions():
+    now = time.time()
+    for t in list(SESSIONS.keys()):
+        if SESSIONS[t]["expires"] < now:
+            SESSIONS.pop(t, None)
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -135,14 +189,39 @@ CREATE TABLE IF NOT EXISTS order_items (
     unit TEXT DEFAULT 'дона',
     price REAL DEFAULT 0,
     quantity REAL DEFAULT 1,
-    total REAL DEFAULT 0
+    total REAL DEFAULT 0,
+    cost_price REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    category TEXT DEFAULT 'other',
+    amount REAL DEFAULT 0,
+    currency TEXT DEFAULT 'TJS',
+    notes TEXT DEFAULT '',
+    expense_date TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
 );
 """
+
+
+def migrate_db(conn):
+    """Иловаи сутунҳои нав агар DB-и кӯҳна бошад."""
+    cur = conn.execute("PRAGMA table_info(order_items)")
+    cols = [r["name"] for r in cur.fetchall()]
+    if "cost_price" not in cols:
+        try:
+            conn.execute("ALTER TABLE order_items ADD COLUMN cost_price REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
 
 
 def init_db():
     conn = db_conn()
     conn.executescript(SCHEMA)
+    migrate_db(conn)
     conn.commit()
     conn.close()
 
@@ -309,16 +388,17 @@ def seed_if_empty():
         chunk = prod_ids[i * 2:i * 2 + 3]
         for pid in chunk:
             row = conn.execute(
-                "SELECT name, unit, price FROM products WHERE id=?", (pid,)
+                "SELECT name, unit, price, cost_price FROM products WHERE id=?", (pid,)
             ).fetchone()
             qty = 5 + i
             line = qty * row["price"]
             subtotal += line
-            conn.execute(
-                "INSERT INTO order_items(order_id, product_id, product_name, unit, "
-                "price, quantity, total) VALUES(?,?,?,?,?,?,?)",
-                (oid, pid, row["name"], row["unit"], row["price"], qty, line),
-            )
+        conn.execute(
+            "INSERT INTO order_items(order_id, product_id, product_name, unit, "
+            "price, quantity, total, cost_price) VALUES(?,?,?,?,?,?,?,?)",
+            (oid, pid, row["name"], row["unit"], row["price"], qty, line,
+             row["cost_price"] if "cost_price" in row.keys() else 0),
+        )
         conn.execute(
             "UPDATE orders SET subtotal=?, total=? WHERE id=?",
             (subtotal, subtotal, oid),
@@ -1028,8 +1108,8 @@ def h_orders_create(req, m, body, qs):
         subtotal += line
         conn.execute(
             "INSERT INTO order_items(order_id, product_id, product_name, unit, "
-            "price, quantity, total) VALUES(?,?,?,?,?,?,?)",
-            (oid, prod["id"], prod["name"], prod["unit"], price, qty, line),
+            "price, quantity, total, cost_price) VALUES(?,?,?,?,?,?,?,?)",
+            (oid, prod["id"], prod["name"], prod["unit"], price, qty, line, prod["cost_price"] or 0),
         )
         conn.execute(
             "UPDATE products SET stock = MAX(0, stock - ?) WHERE id=?",
@@ -1251,6 +1331,463 @@ def h_upload(req, m, body, qs):
     return 201, {"url": f"/uploads/{new_name}"}
 
 
+# ---------- Auth ----------
+@route("POST", r"^/api/auth/login$")
+def h_auth_login(req, m, body, qs):
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    if not _check_password(username, password):
+        time.sleep(0.5)  # бар зидди brute-force
+        return 401, {"error": "Логин ё парол нодуруст"}
+    _cleanup_sessions()
+    token = _new_token()
+    SESSIONS[token] = {
+        "user": username,
+        "expires": time.time() + SESSION_TTL,
+    }
+    return 200, {"token": token, "user": {"username": username, "role": "admin"}}
+
+
+@route("POST", r"^/api/auth/logout$")
+def h_auth_logout(req, m, body, qs):
+    token = _get_token_from_headers(req.headers)
+    if token:
+        SESSIONS.pop(token, None)
+    return 200, {"ok": True}
+
+
+@route("GET", r"^/api/auth/me$")
+def h_auth_me(req, m, body, qs):
+    token = _get_token_from_headers(req.headers)
+    sess = SESSIONS.get(token or "")
+    if not sess or sess["expires"] < time.time():
+        return 401, {"error": "Авторизация лозим"}
+    return 200, {"username": sess["user"], "role": "admin"}
+
+
+# ---------- Expenses ----------
+@route("GET", r"^/api/expenses$")
+def h_expenses_list(req, m, body, qs):
+    conn = db_conn()
+    sql = "SELECT * FROM expenses"
+    where = []
+    args = []
+    if qs.get("from"):
+        where.append("expense_date >= ?")
+        args.append(qs["from"][0])
+    if qs.get("to"):
+        where.append("expense_date <= ?")
+        args.append(qs["to"][0])
+    if qs.get("category"):
+        where.append("category = ?")
+        args.append(qs["category"][0])
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY expense_date DESC, id DESC"
+    rows = conn.execute(sql, args).fetchall()
+    out = [row_to_dict(r) for r in rows]
+    conn.close()
+    return 200, out
+
+
+@route("POST", r"^/api/expenses$")
+def h_expenses_create(req, m, body, qs):
+    title = (body.get("title") or "").strip()
+    if not title:
+        return 400, {"error": "Номи харҷ ҳатмист"}
+    conn = db_conn()
+    eid = conn.execute(
+        "INSERT INTO expenses(title, category, amount, currency, notes, expense_date) "
+        "VALUES(?,?,?,?,?,?)",
+        (title, body.get("category", "other"),
+         float(body.get("amount") or 0), body.get("currency", "TJS"),
+         body.get("notes", ""),
+         body.get("expense_date") or datetime.utcnow().date().isoformat()),
+    ).lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM expenses WHERE id=?", (eid,)).fetchone()
+    out = row_to_dict(row)
+    conn.close()
+    return 201, out
+
+
+@route("PUT", r"^/api/expenses/(?P<eid>\d+)$")
+def h_expenses_update(req, m, body, qs):
+    eid = int(m.group("eid"))
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM expenses WHERE id=?", (eid,)).fetchone()
+    if not row:
+        conn.close(); return 404, {"error": "Не ёфт"}
+    conn.execute(
+        "UPDATE expenses SET title=?, category=?, amount=?, currency=?, "
+        "notes=?, expense_date=? WHERE id=?",
+        ((body.get("title") or row["title"]).strip(),
+         body.get("category", row["category"]),
+         float(body.get("amount", row["amount"]) or 0),
+         body.get("currency", row["currency"]),
+         body.get("notes", row["notes"]),
+         body.get("expense_date") or row["expense_date"], eid),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM expenses WHERE id=?", (eid,)).fetchone()
+    out = row_to_dict(row)
+    conn.close()
+    return 200, out
+
+
+@route("DELETE", r"^/api/expenses/(?P<eid>\d+)$")
+def h_expenses_delete(req, m, body, qs):
+    eid = int(m.group("eid"))
+    conn = db_conn()
+    conn.execute("DELETE FROM expenses WHERE id=?", (eid,))
+    conn.commit()
+    conn.close()
+    return 200, {"ok": True}
+
+
+# ---------- Finance ----------
+@route("GET", r"^/api/finance/stats$")
+def h_finance_stats(req, m, body, qs):
+    """
+    Натиҷа: даромад, нархи худи (харидҳо аз заявкаҳо), фоидаи bruto,
+    харҷҳои мудирӣ, фоидаи соф, маблағи захираи кунунӣ.
+    """
+    conn = db_conn()
+    period = qs.get("period", ["all"])[0]  # all|month|week|today
+
+    where_orders = "status = 'completed'"
+    args = []
+    today = datetime.utcnow().date()
+    start_date = None
+    if period == "today":
+        start_date = today
+    elif period == "week":
+        start_date = today - timedelta(days=7)
+    elif period == "month":
+        start_date = today - timedelta(days=30)
+    elif period == "year":
+        start_date = today - timedelta(days=365)
+    if start_date:
+        where_orders += " AND created_at >= ?"
+        args.append(start_date.isoformat())
+
+    # Даромад (фурӯш)
+    revenue_row = conn.execute(
+        f"SELECT COALESCE(SUM(total),0) r FROM orders WHERE {where_orders}",
+        args,
+    ).fetchone()
+    revenue = revenue_row["r"] or 0
+
+    # Нархи худи (cost) — аз order_items дар ҳамон заявкаҳо
+    cost_row = conn.execute(
+        f"SELECT COALESCE(SUM(oi.cost_price * oi.quantity),0) c "
+        f"FROM order_items oi JOIN orders o ON o.id = oi.order_id "
+        f"WHERE {where_orders.replace('status', 'o.status').replace('created_at', 'o.created_at')}",
+        args,
+    ).fetchone()
+    cost_of_goods = cost_row["c"] or 0
+
+    gross_profit = revenue - cost_of_goods
+
+    # Харҷҳои мудирӣ
+    exp_where = ""
+    exp_args = []
+    if start_date:
+        exp_where = " WHERE expense_date >= ?"
+        exp_args.append(start_date.isoformat())
+    exp_row = conn.execute(
+        f"SELECT COALESCE(SUM(amount),0) e FROM expenses{exp_where}",
+        exp_args,
+    ).fetchone()
+    expenses_total = exp_row["e"] or 0
+
+    net_profit = gross_profit - expenses_total
+
+    # Арзиши захираи ҷорӣ (бо нархи фурӯш)
+    inv_sell = conn.execute(
+        "SELECT COALESCE(SUM(stock*price),0) v FROM products"
+    ).fetchone()["v"] or 0
+
+    # Арзиши захираи ҷорӣ (бо нархи харид)
+    inv_cost = conn.execute(
+        "SELECT COALESCE(SUM(stock*cost_price),0) v FROM products"
+    ).fetchone()["v"] or 0
+
+    # Шумораи заявкаҳо дар давра
+    orders_count = conn.execute(
+        f"SELECT COUNT(*) c FROM orders WHERE {where_orders}", args
+    ).fetchone()["c"]
+
+    # Чарт: даромад/харҷ/фоида барои 12 моҳи охир
+    monthly = []
+    for i in range(11, -1, -1):
+        month_start = (today.replace(day=1) - timedelta(days=i * 30)).replace(day=1)
+        next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        rev = conn.execute(
+            "SELECT COALESCE(SUM(total),0) r FROM orders "
+            "WHERE status='completed' AND created_at >= ? AND created_at < ?",
+            (month_start.isoformat(), next_month.isoformat()),
+        ).fetchone()["r"] or 0
+        cost = conn.execute(
+            "SELECT COALESCE(SUM(oi.cost_price * oi.quantity),0) c "
+            "FROM order_items oi JOIN orders o ON o.id = oi.order_id "
+            "WHERE o.status='completed' AND o.created_at >= ? AND o.created_at < ?",
+            (month_start.isoformat(), next_month.isoformat()),
+        ).fetchone()["c"] or 0
+        exp = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) e FROM expenses "
+            "WHERE expense_date >= ? AND expense_date < ?",
+            (month_start.isoformat(), next_month.isoformat()),
+        ).fetchone()["e"] or 0
+        monthly.append({
+            "month": month_start.isoformat(),
+            "label": ["Янв","Фев","Мар","Апр","Май","Июн","Июл","Авг","Сен","Окт","Ноя","Дек"][month_start.month - 1],
+            "revenue": float(rev),
+            "cost": float(cost),
+            "expenses": float(exp),
+            "profit": float(rev - cost - exp),
+        })
+
+    # Харҷҳо ба гурӯҳ
+    by_category = conn.execute(
+        f"SELECT category, COALESCE(SUM(amount),0) total FROM expenses{exp_where} "
+        "GROUP BY category ORDER BY total DESC",
+        exp_args,
+    ).fetchall()
+
+    conn.close()
+    return 200, {
+        "period": period,
+        "revenue": float(revenue),
+        "cost_of_goods": float(cost_of_goods),
+        "gross_profit": float(gross_profit),
+        "expenses_total": float(expenses_total),
+        "net_profit": float(net_profit),
+        "inventory_value_sell": float(inv_sell),
+        "inventory_value_cost": float(inv_cost),
+        "orders_count": orders_count,
+        "margin_percent": float((gross_profit / revenue * 100) if revenue else 0),
+        "monthly": monthly,
+        "expenses_by_category": [
+            {"category": r["category"], "total": float(r["total"])} for r in by_category
+        ],
+    }
+
+
+# ---------- Export ----------
+def _make_xlsx(sheet_name: str, headers: list[str], rows: list[list]) -> bytes:
+    """Сохтани файли .xlsx дар хотира бо stdlib танҳо."""
+    from xml.sax.saxutils import escape as xml_escape
+
+    def cell(val, col_letter, row_num):
+        if val is None:
+            val = ""
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return f'<c r="{col_letter}{row_num}" t="n"><v>{val}</v></c>'
+        s = xml_escape(str(val))
+        # SharedStrings бар нагирад — inlineStr
+        return f'<c r="{col_letter}{row_num}" t="inlineStr"><is><t xml:space="preserve">{s}</t></is></c>'
+
+    def col_letter(idx: int) -> str:
+        # 0->A, 25->Z, 26->AA
+        s = ""
+        idx += 1
+        while idx > 0:
+            idx, rem = divmod(idx - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    rows_xml = []
+    # Header row
+    header_cells = "".join(cell(h, col_letter(i), 1) for i, h in enumerate(headers))
+    rows_xml.append(f'<row r="1">{header_cells}</row>')
+    # Data rows
+    for ri, row in enumerate(rows, start=2):
+        cells = "".join(cell(v, col_letter(i), ri) for i, v in enumerate(row))
+        rows_xml.append(f'<row r="{ri}">{cells}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>' + "".join(rows_xml) + '</sheetData></worksheet>'
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{xml_escape(sheet_name)[:31]}" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
+def _make_csv(headers: list[str], rows: list[list]) -> bytes:
+    """CSV бо UTF-8 BOM то ки Excel дуруст кушояд."""
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+    w.writerow(headers)
+    for row in rows:
+        w.writerow(["" if v is None else v for v in row])
+    return "\ufeff".encode("utf-8") + buf.getvalue().encode("utf-8")
+
+
+def _export_data(entity: str) -> tuple[str, list[str], list[list]]:
+    """Бар гардонад: (sheet_name, headers, rows) барои entity-и муайян."""
+    conn = db_conn()
+    if entity == "products":
+        rows_data = conn.execute(
+            "SELECT p.id, p.name, p.sku, p.unit, p.price, p.cost_price, p.currency, "
+            "p.stock, p.min_stock, c.name AS cat, s.name AS sub, sup.name AS sup_name, "
+            "p.description, p.created_at "
+            "FROM products p "
+            "LEFT JOIN subcategories s ON s.id=p.subcategory_id "
+            "LEFT JOIN categories c ON c.id=s.category_id "
+            "LEFT JOIN suppliers sup ON sup.id=p.supplier_id "
+            "ORDER BY p.created_at DESC"
+        ).fetchall()
+        headers = ["№", "Ном", "Артикул", "Воҳид", "Нархи фурӯш", "Нархи харид",
+                   "Валюта", "Захира", "Минимум", "Категория", "Подкатегория",
+                   "Фурушанда", "Тавсиф", "Сана"]
+        rows = [[r["id"], r["name"], r["sku"] or "", r["unit"], r["price"],
+                 r["cost_price"], r["currency"], r["stock"], r["min_stock"],
+                 r["cat"] or "", r["sub"] or "", r["sup_name"] or "",
+                 r["description"] or "", r["created_at"]] for r in rows_data]
+        sheet = "Маҳсулот"
+
+    elif entity == "orders":
+        rows_data = conn.execute(
+            "SELECT o.id, o.order_number, c.name AS client, c.phone, o.status, "
+            "o.subtotal, o.discount, o.total, o.delivery_address, o.created_at "
+            "FROM orders o LEFT JOIN clients c ON c.id=o.client_id "
+            "ORDER BY o.created_at DESC"
+        ).fetchall()
+        headers = ["№", "Рақами заявка", "Клиент", "Телефон", "Статус",
+                   "Зерҷамъ", "Тахфиф", "Маблағи умумӣ", "Суроға", "Сана"]
+        status_map = {"new": "Нав", "in_progress": "Дар ҳол",
+                      "completed": "Анҷом", "cancelled": "Бекор"}
+        rows = [[r["id"], r["order_number"], r["client"] or "", r["phone"] or "",
+                 status_map.get(r["status"], r["status"]),
+                 r["subtotal"], r["discount"], r["total"],
+                 r["delivery_address"] or "", r["created_at"]] for r in rows_data]
+        sheet = "Заявкаҳо"
+
+    elif entity == "clients":
+        rows_data = conn.execute(
+            "SELECT c.id, c.name, c.phone, c.phone2, c.email, c.company, "
+            "c.address, c.status, COUNT(o.id) AS orders_cnt, "
+            "COALESCE(SUM(o.total),0) AS total_spent, c.created_at "
+            "FROM clients c LEFT JOIN orders o ON o.client_id=c.id "
+            "GROUP BY c.id ORDER BY c.created_at DESC"
+        ).fetchall()
+        headers = ["№", "Ном", "Телефон", "Телефони иловагӣ", "Email", "Ширкат",
+                   "Суроға", "Статус", "Заявкаҳо", "Маблағи умумӣ", "Сана"]
+        st = {"active": "Фаъол", "vip": "VIP", "blocked": "Манъ"}
+        rows = [[r["id"], r["name"], r["phone"] or "", r["phone2"] or "",
+                 r["email"] or "", r["company"] or "", r["address"] or "",
+                 st.get(r["status"], r["status"]), r["orders_cnt"],
+                 r["total_spent"], r["created_at"]] for r in rows_data]
+        sheet = "Клиентҳо"
+
+    elif entity == "suppliers":
+        rows_data = conn.execute(
+            "SELECT s.id, s.name, s.company, s.phone, s.phone2, s.email, "
+            "s.market, s.address, s.rating, COUNT(p.id) AS products_cnt, "
+            "s.notes, s.created_at "
+            "FROM suppliers s LEFT JOIN products p ON p.supplier_id=s.id "
+            "GROUP BY s.id ORDER BY s.name"
+        ).fetchall()
+        headers = ["№", "Ном", "Ширкат", "Телефон", "Тел. иловагӣ", "Email",
+                   "Бозор", "Суроға", "Рейтинг", "Маҳсулот", "Эзоҳ", "Сана"]
+        rows = [[r["id"], r["name"], r["company"] or "", r["phone"] or "",
+                 r["phone2"] or "", r["email"] or "", r["market"] or "",
+                 r["address"] or "", r["rating"], r["products_cnt"],
+                 r["notes"] or "", r["created_at"]] for r in rows_data]
+        sheet = "Фурушандагон"
+
+    elif entity == "expenses":
+        rows_data = conn.execute(
+            "SELECT id, title, category, amount, currency, expense_date, notes, created_at "
+            "FROM expenses ORDER BY expense_date DESC"
+        ).fetchall()
+        headers = ["№", "Ном", "Категория", "Маблағ", "Валюта", "Сана", "Эзоҳ", "Илова шуд"]
+        rows = [[r["id"], r["title"], r["category"], r["amount"], r["currency"],
+                 r["expense_date"] or "", r["notes"] or "", r["created_at"]]
+                for r in rows_data]
+        sheet = "Харҷҳо"
+
+    elif entity == "finance":
+        # Хулосаи финансӣ
+        rev = conn.execute("SELECT COALESCE(SUM(total),0) r FROM orders WHERE status='completed'").fetchone()["r"] or 0
+        cost = conn.execute(
+            "SELECT COALESCE(SUM(oi.cost_price*oi.quantity),0) c FROM order_items oi "
+            "JOIN orders o ON o.id=oi.order_id WHERE o.status='completed'"
+        ).fetchone()["c"] or 0
+        exp = conn.execute("SELECT COALESCE(SUM(amount),0) e FROM expenses").fetchone()["e"] or 0
+        inv_s = conn.execute("SELECT COALESCE(SUM(stock*price),0) v FROM products").fetchone()["v"] or 0
+        inv_c = conn.execute("SELECT COALESCE(SUM(stock*cost_price),0) v FROM products").fetchone()["v"] or 0
+        headers = ["Нишондиҳанда", "Маблағ (TJS)"]
+        rows = [
+            ["Даромад (фурӯши анҷом)", float(rev)],
+            ["Нархи худи (cost of goods)", float(cost)],
+            ["Фоидаи bruto", float(rev - cost)],
+            ["Харҷҳои мудирӣ", float(exp)],
+            ["Фоидаи соф", float(rev - cost - exp)],
+            ["Арзиши захираи ҷорӣ (фурӯш)", float(inv_s)],
+            ["Арзиши захираи ҷорӣ (харид)", float(inv_c)],
+            ["Маржа (%)", round((rev - cost) / rev * 100, 2) if rev else 0],
+        ]
+        sheet = "Молия"
+
+    else:
+        conn.close()
+        raise ValueError(f"Unknown entity: {entity}")
+
+    conn.close()
+    return sheet, headers, rows
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
@@ -1266,7 +1803,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -1288,7 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
     def _handle(self, method: str):
@@ -1298,6 +1835,49 @@ class Handler(BaseHTTPRequestHandler):
 
         # API routes
         if path.startswith("/api/"):
+            # Authentication check
+            public_paths = {
+                ("POST", "/api/auth/login"),
+                ("GET", "/api/health"),
+            }
+            if (method, path) not in public_paths and not _is_authed(self.headers):
+                return self._send_json(401, {"error": "Авторизация лозим"})
+
+            # Export endpoints (binary download)
+            if path.startswith("/api/export/") and method == "GET":
+                entity = path[len("/api/export/"):]
+                fmt = (qs.get("format", ["xlsx"])[0] or "xlsx").lower()
+                try:
+                    sheet, headers, rows = _export_data(entity)
+                except ValueError:
+                    return self._send_json(404, {"error": "Entity not found"})
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    return self._send_json(500, {"error": str(e)})
+
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M")
+                if fmt == "csv":
+                    data = _make_csv(headers, rows)
+                    fname = f"alistroy_{entity}_{ts}.csv"
+                    ctype = "text/csv; charset=utf-8"
+                else:
+                    data = _make_xlsx(sheet, headers, rows)
+                    fname = f"alistroy_{entity}_{ts}.xlsx"
+                    ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{fname}"',
+                )
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b""
             ctype = self.headers.get("Content-Type", "")
@@ -1356,8 +1936,12 @@ def main():
     port = int(os.environ.get("PORT", 5000))
     host = os.environ.get("HOST", "0.0.0.0")
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"\n  AliStroy CRM иҷро шуда истодааст:")
-    print(f"  -> http://localhost:{port}\n")
+    print(f"\n  ╔══════════════════════════════════════════╗")
+    print(f"  ║  AliStroy CRM — server running           ║")
+    print(f"  ║  Listen: http://{host}:{port}{' ' * (24 - len(host) - len(str(port)))}║")
+    print(f"  ║  Login:  {ADMIN_USERNAME:<32}║")
+    print(f"  ║  (бо HOST=0.0.0.0 берунаро дастрас аст)  ║")
+    print(f"  ╚══════════════════════════════════════════╝\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

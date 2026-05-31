@@ -223,7 +223,7 @@ window.AppViews.Orders = {
 
         async function onSaved() {
             formShow.value = false;
-            await load();
+            window.EventBus?.emit('data:orders'); await load();
             window.toast.success('Заявка қабул шуд');
         }
 
@@ -289,13 +289,21 @@ window.AppViews.Orders = {
                         await window.API.orders.remove(o.id);
                         window.toast.success('Заявка нест шуд');
                         confirm.show = false;
-                        await load();
+                        window.EventBus?.emit('data:orders'); await load();
                     } catch (e) { window.toast.error(e.message); }
                 },
             });
         }
 
-        Vue.onMounted(load);
+        const _evtCleanup = [];
+        Vue.onMounted(() => {
+            load();
+            ['data:orders', 'data:products', 'data:clients'].forEach(ev => {
+                const off = window.EventBus?.on(ev, load);
+                if (off) _evtCleanup.push(off);
+            });
+        });
+        Vue.onUnmounted(() => { _evtCleanup.forEach(fn => fn()); });
 
         return {
             orders, filtered, loading, q, statusFilter,

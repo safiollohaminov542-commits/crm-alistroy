@@ -254,7 +254,7 @@ window.AppViews.Suppliers = {
                     window.toast.success('Фурушанда илова шуд');
                 }
                 formShow.value = false;
-                await load();
+                window.EventBus?.emit('data:suppliers'); await load();
             } catch (e) { window.toast.error(e.message); }
         }
 
@@ -276,13 +276,21 @@ window.AppViews.Suppliers = {
                         await window.API.suppliers.remove(s.id);
                         window.toast.success('Фурушанда нест шуд');
                         confirm.show = false;
-                        await load();
+                        window.EventBus?.emit('data:suppliers'); await load();
                     } catch (e) { window.toast.error(e.message); }
                 },
             });
         }
 
-        Vue.onMounted(load);
+        const _evtCleanup = [];
+        Vue.onMounted(() => {
+            load();
+            ['data:suppliers', 'data:products'].forEach(ev => {
+                const off = window.EventBus?.on(ev, load);
+                if (off) _evtCleanup.push(off);
+            });
+        });
+        Vue.onUnmounted(() => { _evtCleanup.forEach(fn => fn()); });
 
         return {
             suppliers, filtered, loading, q,

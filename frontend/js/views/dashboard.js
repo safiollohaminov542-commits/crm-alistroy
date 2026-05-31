@@ -312,7 +312,15 @@ window.AppViews.Dashboard = {
 
         function goTo(view, params) { app && app.navigate(view, params); }
 
-        Vue.onMounted(load);
+        const _evtCleanup = [];
+        Vue.onMounted(() => {
+            load();
+            ['data:orders', 'data:products', 'data:expenses', 'data:clients'].forEach(ev => {
+                const off = window.EventBus?.on(ev, load);
+                if (off) _evtCleanup.push(off);
+            });
+        });
+        Vue.onUnmounted(() => { _evtCleanup.forEach(fn => fn()); });
 
         return {
             stats, loading, weekTotal, maxDayIdx, completedRatio,

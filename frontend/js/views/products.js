@@ -448,7 +448,7 @@ window.AppViews.Products = {
                     window.toast.success('Маҳсулот илова шуд');
                 }
                 formShow.value = false;
-                await load();
+                window.EventBus?.emit('data:products'); await load();
             } catch (e) { window.toast.error(e.message); }
         }
 
@@ -470,13 +470,21 @@ window.AppViews.Products = {
                         await window.API.products.remove(p.id);
                         window.toast.success('Маҳсулот нест шуд');
                         confirm.show = false;
-                        await load();
+                        window.EventBus?.emit('data:products'); await load();
                     } catch (e) { window.toast.error(e.message); }
                 },
             });
         }
 
-        Vue.onMounted(load);
+        const _evtCleanup = [];
+        Vue.onMounted(() => {
+            load();
+            ['data:products', 'data:categories', 'data:suppliers'].forEach(ev => {
+                const off = window.EventBus?.on(ev, load);
+                if (off) _evtCleanup.push(off);
+            });
+        });
+        Vue.onUnmounted(() => { _evtCleanup.forEach(fn => fn()); });
 
         return {
             products, categories, subcategories, suppliers,

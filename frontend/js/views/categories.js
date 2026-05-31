@@ -208,7 +208,7 @@ window.AppViews.Categories = {
                     window.toast.success('Категория илова шуд');
                 }
                 catShow.value = false;
-                await load();
+                window.EventBus?.emit('data:categories'); await load();
             } catch (e) { window.toast.error(e.message); }
         }
 
@@ -219,10 +219,10 @@ window.AppViews.Categories = {
                     window.toast.success('Подкатегория навсозӣ шуд');
                 } else {
                     await window.API.subcategories.create(subForm);
-                    window.toast.success('Подкатегория илова шуд');
+                    window.toast.success('Подкатегория илова шуд'); window.EventBus?.emit('data:subcategories');
                 }
                 subShow.value = false;
-                await load();
+                window.EventBus?.emit('data:categories'); await load();
             } catch (e) { window.toast.error(e.message); }
         }
 
@@ -237,7 +237,7 @@ window.AppViews.Categories = {
                         await window.API.categories.remove(cat.id);
                         window.toast.success('Категория нест шуд');
                         confirm.show = false;
-                        await load();
+                        window.EventBus?.emit('data:categories'); await load();
                     } catch (e) { window.toast.error(e.message); }
                 },
             });
@@ -252,15 +252,23 @@ window.AppViews.Categories = {
                 action: async () => {
                     try {
                         await window.API.subcategories.remove(sub.id);
-                        window.toast.success('Подкатегория нест шуд');
+                        window.toast.success('Подкатегория нест шуд'); window.EventBus?.emit('data:subcategories');
                         confirm.show = false;
-                        await load();
+                        window.EventBus?.emit('data:categories'); await load();
                     } catch (e) { window.toast.error(e.message); }
                 },
             });
         }
 
-        Vue.onMounted(load);
+        const _evtCleanup = [];
+        Vue.onMounted(() => {
+            load();
+            ['data:categories', 'data:subcategories', 'data:products'].forEach(ev => {
+                const off = window.EventBus?.on(ev, load);
+                if (off) _evtCleanup.push(off);
+            });
+        });
+        Vue.onUnmounted(() => { _evtCleanup.forEach(fn => fn()); });
 
         return {
             categories, loading,
