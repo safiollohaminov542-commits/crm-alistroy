@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+backend/alistroy.db
+backend/alistroy.db-journal
+
+# Uploads (real user uploads should not be in git)
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Node (агар оянда дар плагин истифода шавад)
+node_modules/
